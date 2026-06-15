@@ -19,6 +19,7 @@ from sharpa import (
     SharpaWaveManager,
     ControlMode,
     ControlSource,
+    SharpaWaveConfig,
 )
 
 if TYPE_CHECKING:
@@ -128,20 +129,14 @@ class SharpaWaveInhandRotateDeployEnv(gym.Env):
 
     def _init_hand(self):
         self.hand = self.auto_detect_hand()
-        self.hand_info = self.hand.get_device_info()
         if self.hand is None:
             print("Error: No available device found")
             exit(1)
+        self.hand_info = self.hand.get_device_info()
         print("Sharpa Wave Example - Init Hand Running Mode")
         if not self.initialize():
             print("Error: Failed to initialize hand")
             exit(1)
-        custom_config_path = "/root/.sharpa-pilot/config/tactile.json"
-        error = self.hand.set_tactile_config_file(custom_config_path)
-        if error.code == 0:
-            print(f"Custom tactile config set for device: {custom_config_path}")
-        else:
-            print(f"Failed to set tactile config for device: {error.message}")
         self.hand.start()
 
     def auto_detect_hand(self):
@@ -158,27 +153,32 @@ class SharpaWaveInhandRotateDeployEnv(gym.Env):
                     time.sleep(1)
                     continue
                 else:
-                    print(f"Device found: {devices[0]}")
-                    return manager.connect(devices[0])
+                    sn_id = 0
+                    print(f"Device found: {devices[sn_id]}")
+                    cfg = SharpaWaveConfig()
+                    cfg.tactile_config_file = "/root/.sharpa-pilot/config/tactile.json"
+                    return manager.connect(devices[sn_id], cfg)
         except Exception as e:
             print(f"Failed to connect to device: {str(e)}")
             exit(1)
 
     def initialize(self):
-        error = self.hand.set_control_mode(ControlMode.POSITION)
+        control_mode = getattr(ControlMode, getattr(self.cfg, "control_mode", "POSITION"))
+        error = self.hand.set_control_mode(control_mode)
         if error.code != 0:
             print(f"Failed to set control mode: {error.message}")
             return False
-        error = self.hand.set_speed_coeff(0.3)
+        error = self.hand.set_speed_coeff(getattr(self.cfg, "speed_coef", 0.5))
         if error.code != 0:
             print(f"Failed to set speed coeff: {error.message}")
             return False
 
-        error = self.hand.set_current_coeff(self.cfg.current_coef)
+        error = self.hand.set_current_coeff(getattr(self.cfg, "current_coef", 0.3))
         if error.code != 0:
             print(f"Failed to set current coeff: {error.message}")
             return False
-        error = self.hand.set_control_source(ControlSource.SDK)
+        control_source = getattr(ControlSource, getattr(self.cfg, "control_source", "SDK"))
+        error = self.hand.set_control_source(control_source)
         if error.code != 0:
             print(f"Failed to set control source: {error.message}")
             return False
@@ -193,7 +193,7 @@ class SharpaWaveInhandRotateDeployEnv(gym.Env):
         return True
 
     def change_tactile_config(self, on_board=False):
-        """Modify tactile.json based on inference device (board or host)."""
+        """Switch tactile inference between on-board and host mode."""
         tactile_config_path = '/root/.sharpa-pilot/config/tactile.json'
 
         try:
@@ -201,10 +201,11 @@ class SharpaWaveInhandRotateDeployEnv(gym.Env):
                 config = json.load(f)
             
             side = 'left' if self.cfg.hand_side == 0 else 'right'
+            side_cfg = config['cuda'][side]
             fps = 30 if on_board else 180
             infer_from_device = True if on_board else False
-            config['cuda'][side]['fps'] = fps
-            config['cuda'][side]['infer_from_device'] = infer_from_device
+            side_cfg['fps'] = fps
+            side_cfg['infer_from_device'] = infer_from_device
             print(f"[TactileConfig] Set to {'on-board' if on_board else 'host'} mode: fps={fps}, infer_from_device={infer_from_device} for {side} hand")
             with open(tactile_config_path, 'w') as f:
                 json.dump(config, f, indent=2)

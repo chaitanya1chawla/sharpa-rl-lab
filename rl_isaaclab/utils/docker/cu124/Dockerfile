@@ -1,4 +1,4 @@
-FROM sharpadev/sharpawavesdk:4.3.2
+FROM sharpadev/sharpawavesdk:5.0.0.8b7e.cu124
 
 RUN apt-get update && \
     apt-get install -y \

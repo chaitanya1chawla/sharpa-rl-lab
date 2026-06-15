@@ -54,8 +54,12 @@ python rl_isaaclab/scripts/play.py --task Isaac-Inhand-Rotate-Sharpa-Wave-v0 --n
 ### 4.2.1. Configure docker
 ```bash
 # INFOℹ️: Install docker and nvidia-ctk following steps 1-4 in <Steps to Acquire 180 Hz High-Frame-Rate High-Performance Tactile Information>.
-cd rl_isaaclab/utils
-# Configure docker-compose, substitute ${sharpa-rl-lab} with this repo path.
+# Choose the docker config according to your CUDA version:
+#   CUDA 12.4 -> rl_isaaclab/utils/docker/cu124
+#   CUDA 12.8 -> rl_isaaclab/utils/docker/cu128
+cd rl_isaaclab/utils/docker/cu124
+# cd rl_isaaclab/utils/docker/cu128
+export SHARPAWAVE_RL_LAB=$(git rev-parse --show-toplevel)
 xhost +local:root
 USER_ID=$(id -u) GROUP_ID=$(id -g) docker compose up -d
 docker exec -it sharpawave_rl_dev bash
