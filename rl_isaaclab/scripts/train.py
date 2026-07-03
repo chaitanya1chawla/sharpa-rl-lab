@@ -90,6 +90,7 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     env = GymStyleEnvWrapper(env, clip_actions=env_cfg.clip_actions)
     agent = eval(agent_cfg["algo"])(env, output_dir=log_dir, full_config=config)
 
+    # save configs
     spec = gym.spec(args_cli.task)
     env_cfg_file = spec.kwargs.get("env_cfg_entry_point", None).split(":")[0].replace(".", "/") + ".py"
     agent_cfg_file = spec.kwargs.get("agent_cfg_entry_point", None).replace(".", "/").replace(":", "/").replace("/yaml", ".yaml")

@@ -20,7 +20,7 @@ from rl_isaaclab.algo.models.running_mean_std import RunningMeanStd
 
 from rl_isaaclab.utils.misc import AverageScalarMeter
 
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 
 
 class PPO(object):

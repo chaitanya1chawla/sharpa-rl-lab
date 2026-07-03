@@ -10,7 +10,7 @@
 # https://github.com/Denys88/rl_games/
 # --------------------------------------------------------
 
-import gym
+#import gym
 import torch
 from torch.utils.data import Dataset
 

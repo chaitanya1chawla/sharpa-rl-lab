@@ -42,7 +42,7 @@ class SharpaWaveEnvCfg(DirectRLEnvCfg):
     action_space = 22
     observation_space = 192
     prop_hist_len = 30      # Proprioception hist frames used in policy
-    priv_info_dim = 8
+    priv_info_dim = 14
     state_space = 0
     asymmetric_obs = False
     # control
@@ -266,9 +266,14 @@ class SharpaWaveEnvCfg(DirectRLEnvCfg):
     reset_random_quat = False             # If True, the quaternion of the hand and object is randomized.
     # reward
     rot_axis = (0, 0, 1)                  # Rotation axis used in reward function.
-    angvel_clip_min = -0.5
-    angvel_clip_max = 0.5                 
-    rotate_reward_scale = 2.5            
+    target_rot_axis = (0, 0, 1)           # Axis used to sample goal rotations from cached grasp poses.
+    target_angle_levels = [5, 10, 20, 30, 45, 60, 90, 120, 180] # Degrees.
+    target_success_tolerance = 5 / 180 * math.pi
+    target_curriculum_success_threshold = 0.8
+    target_curriculum_ema_alpha = 0.02
+    target_curriculum_update_interval = 200
+    orientation_error_reward_scale = 3.0
+    orientation_success_bonus = 2.0
     object_linvel_penalty_scale = -0.3
     pos_diff_penalty_scale = -0.4
     torque_penalty_scale = -0.1

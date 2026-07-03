@@ -63,6 +63,14 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
         self.object_pos_prev = torch.zeros((self.num_envs, 3), dtype=torch.float, device=self.device)
         self.object_rot_prev = torch.zeros((self.num_envs, 4), dtype=torch.float, device=self.device)
         self.object_default_pose = torch.zeros((self.num_envs, 7), dtype=torch.float, device=self.device)
+        self.target_object_pos = torch.zeros((self.num_envs, 3), dtype=torch.float, device=self.device)
+        self.target_object_rot = torch.zeros((self.num_envs, 4), dtype=torch.float, device=self.device)
+        self.target_object_rot[:, 0] = 1.0
+        self.target_delta_angle = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.episode_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.curriculum_success_ema = torch.tensor(0.0, dtype=torch.float, device=self.device)
+        self.curriculum_level = 0
+        self.last_curriculum_update_step = 0
         self.rb_forces = torch.zeros((self.num_envs, 3), dtype=torch.float, device=self.device)
 
         # buffers for data
@@ -103,6 +111,7 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
                 act.damping = torch.zeros_like(act.damping, device=self.device)
 
         # grasp_cache
+        # scale_range = [0.5, 0.5, 1] # Scale size of the object, [lower, upper, num].
         if self.num_envs % self.cfg.scale_range[2] != 0:
             carb.log_error(f"num_envs must be divisible by scale num: {self.cfg.scale_range[2]}")
             exit()
@@ -117,6 +126,7 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
             self.saved_grasping_states = None
 
         self.rot_axis = torch.tensor(self.cfg.rot_axis, dtype=torch.float32).repeat(self.num_envs, 1).to(self.device)
+        self.target_rot_axis = torch.tensor(self.cfg.target_rot_axis, dtype=torch.float32).repeat(self.num_envs, 1).to(self.device)
 
         # contact buffers
         self._contact_body_ids = torch.tensor([0, 1, 2, 3, 4], dtype=torch.long)
@@ -140,15 +150,15 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
             rand_friction_hand = rand_friction.clone().repeat(1, 26) * self.cfg.metal_base_friction
             rand_friction_hand[:, material_elastomer_ids] = rand_friction_hand[:, material_elastomer_ids] / self.cfg.metal_base_friction * self.cfg.elastomer_base_friction
             self.set_friction(self.hand, rand_friction_hand, self.num_envs)
-            self.priv_info_buf[:, 3] = rand_friction.squeeze()
+            self.priv_info_buf[:, 9] = rand_friction.squeeze()
         if self.cfg.randomize_com:
             rand_com = torch.empty([self.num_envs, 3]).uniform_(self.cfg.randomize_com_lower, self.cfg.randomize_com_upper)
             self.set_com(self.object, rand_com, self.num_envs)
-            self.priv_info_buf[:, 5:8] = self.object.root_physx_view.get_coms().reshape(self.num_envs, -1)[:, :3]
+            self.priv_info_buf[:, 11:14] = self.object.root_physx_view.get_coms().reshape(self.num_envs, -1)[:, :3]
         if self.cfg.randomize_mass:
             rand_mass = torch.empty(self.num_envs).uniform_(self.cfg.randomize_mass_lower, self.cfg.randomize_mass_upper)
             self.set_mass(self.object, rand_mass, self.num_envs)
-            self.priv_info_buf[:, 4] = self.object.root_physx_view.get_masses().reshape(self.num_envs)
+            self.priv_info_buf[:, 10] = self.object.root_physx_view.get_masses().reshape(self.num_envs)
 
         # physics_sim_view
         self.physics_sim_view: physx.SimulationView = sim_utils.SimulationContext.instance().physics_sim_view
@@ -187,13 +197,13 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
         self.object_rot_prev[:] = self.object_rot
 
         if self.cfg.force_scale > 0.0:
-            self.rb_forces *= torch.pow(torch.tensor(self.cfg.force_decay, dtype=torch.float32), self.physics_dt / self.cfg.force_decay_interval)
+            self.rb_forces *= torch.pow(torch.tensor(self.cfg.force_decay, dtype=torch.float32, device=self.device), self.physics_dt / self.cfg.force_decay_interval)
             # apply new forces
             obj_mass = self.object.root_physx_view.get_masses().reshape(self.num_envs).to(self.device)
             prob = self.cfg.random_force_prob_scalar
             force_indices = (torch.less(torch.rand(self.num_envs, device=self.device), prob)).nonzero().to(self.device)
             self.rb_forces[force_indices, :] = torch.randn(self.rb_forces[force_indices, :].shape, device=self.device) * obj_mass[force_indices, None] * self.cfg.force_scale
-            self.object.set_external_force_and_torque(forces=self.rb_forces.reshape(self.num_envs, 1, 3), torques=torch.zeros(self.num_envs, 1, 3))
+            self.object.set_external_force_and_torque(forces=self.rb_forces.reshape(self.num_envs, 1, 3), torques=torch.zeros(self.num_envs, 1, 3, device=self.device))
 
     def _apply_action(self) -> None:
         self._refresh_lab()
@@ -215,16 +225,21 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
-        object_angvel = axis_angle_from_quat(quat_mul(self.object_rot, quat_conjugate(self.object_rot_prev))) / self.step_dt
-        rotate_reward = saturate((object_angvel * self.rot_axis).sum(-1), torch.tensor(self.cfg.angvel_clip_min), torch.tensor(self.cfg.angvel_clip_max))
+        target_rel_rot = quat_mul(self.target_object_rot, quat_conjugate(self.object_rot))
+        ori_error = quat_error_magnitude(target_rel_rot)
+        orientation_reward = 1.0 - ori_error / torch.pi
+        success = ori_error < self.cfg.target_success_tolerance
+        self.episode_success |= success
+
         object_linvel_penalty = torch.norm(self.object_pos - self.object_pos_prev, p=1, dim=-1) / self.step_dt
         pos_diff_penalty = ((self.hand_dof_pos[:, self.actuated_dof_indices] - self.hand.data.default_joint_pos[:, self.actuated_dof_indices]) ** 2).sum(-1)
         torque_penalty = (self.hand_dof_torque[:, self.actuated_dof_indices] ** 2).sum(-1)
         work_penalty = ((self.hand_dof_torque[:, self.actuated_dof_indices] * self.hand_dof_vel[:, self.actuated_dof_indices]).sum(-1)) ** 2
-        object_pos_diff = 1.0 / (torch.norm(self.object_pos - self.object_default_pose.clone()[:, :3], dim=-1) + 0.001)
+        object_pos_diff = 1.0 / (torch.norm(self.object_pos - self.target_object_pos, dim=-1) + 0.001)
 
         total_reward = compute_rewards(
-            rotate_reward, self.cfg.rotate_reward_scale,
+            orientation_reward, self.cfg.orientation_error_reward_scale,
+            success.float(), self.cfg.orientation_success_bonus,
             object_linvel_penalty, self.cfg.object_linvel_penalty_scale,
             pos_diff_penalty, self.cfg.pos_diff_penalty_scale,
             torque_penalty, self.cfg.torque_penalty_scale,
@@ -232,15 +247,19 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
             object_pos_diff, self.cfg.object_pos_reward_scale,
         )
 
-        self.extras["rotate_reward"] = rotate_reward.mean()
+        self.extras["orientation_reward"] = orientation_reward.mean()
+        self.extras["ori_error_rad"] = ori_error.mean()
+        self.extras["success_rate"] = success.float().mean()
+        self.extras["episode_success_rate"] = self.episode_success.float().mean()
+        self.extras["target_angle_max"] = self._target_angle_max()
+        self.extras["target_delta_angle"] = self.target_delta_angle.abs().mean()
+        self.extras["curriculum_level"] = self.curriculum_level
+        self.extras["curriculum_success_ema"] = self.curriculum_success_ema
         self.extras["object_linvel_penalty"] = object_linvel_penalty.mean()
         self.extras["pos_diff_penalty"] = pos_diff_penalty.mean()
         self.extras["torque_penalty"] = torque_penalty.mean()
         self.extras["work_penalty"] = work_penalty.mean()
         self.extras['object_pos_diff'] = object_pos_diff.mean()
-        self.extras['roll'] = object_angvel[:, 0].mean()
-        self.extras['pitch'] = object_angvel[:, 1].mean()
-        self.extras['yaw'] = object_angvel[:, 2].mean()
         self.extras['gravity_x'] = self.physics_sim_view.get_gravity()[0]
         self.extras['gravity_y'] = self.physics_sim_view.get_gravity()[1]
         self.extras['gravity_z'] = self.physics_sim_view.get_gravity()[2]
@@ -256,6 +275,9 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
         self.extras['height_reset_upper'] = height_reset_upper.float().mean()
         self.extras['height_reset_lower'] = height_reset_lower.float().mean()
         self.extras['time_out'] = time_out.float().mean()
+
+        # gravity curriculum
+        # one gravity for all envs
         if self.extras['height_reset_upper'] < 5e-4 and self.extras['height_reset_lower'] < 5e-4 and self.cfg.gravity_curriculum and self.common_step_counter > 1000:
             gravity_amp = self.physics_sim_view.get_gravity()
             gravity_amp = torch.sqrt(torch.tensor(gravity_amp[0]**2+gravity_amp[1]**2+gravity_amp[2]**2))
@@ -299,11 +321,16 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
         else:
             raise RuntimeError("No saved grasping states found")
         
+        # reset rotation axis
         if self.cfg.reset_random_quat:
             rotate_center = self.hand.data.default_root_state.clone()[env_ids, :3]
             q_rand = get_random_rotation(env_ids, self.device)
             self.rot_axis[env_ids] = torch.tensor(self.cfg.rot_axis, device=self.device, dtype=torch.float32)
             self.rot_axis[env_ids] = rotate_axis_by_quat(self.rot_axis[env_ids], q_rand)
+            self.target_rot_axis[env_ids] = torch.tensor(self.cfg.target_rot_axis, device=self.device, dtype=torch.float32)
+            self.target_rot_axis[env_ids] = rotate_axis_by_quat(self.target_rot_axis[env_ids], q_rand)
+        else:
+            self.target_rot_axis[env_ids] = torch.tensor(self.cfg.target_rot_axis, device=self.device, dtype=torch.float32)
 
         # reset object
         object_default_state = self.object.data.default_root_state.clone()[env_ids]
@@ -321,6 +348,7 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
         self.object.write_root_pose_to_sim(object_default_state[:, :7], env_ids)
         self.object.write_root_velocity_to_sim(object_default_state[:, 7:], env_ids)
         self.object_default_pose[env_ids, 3:7] = object_default_state[:, 3:7]
+        self._sample_axis_limited_targets(env_ids, object_default_state[:, :3] - self.scene.env_origins[env_ids], object_default_state[:, 3:7])
         self.rb_forces[env_ids, :] = 0.0
 
         self.reset_height_lower[env_ids] = object_default_state[:, 2] - (self.cfg.reset_height_upper - self.cfg.reset_height_lower) / 2
@@ -342,10 +370,40 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
         self.object_pos_prev[env_ids] = self.object_pos[env_ids]
         self.object_rot_prev[env_ids] = self.object_rot[env_ids]
 
+        self._update_target_curriculum(env_ids)
+
         # reset data buffers
         self.last_contacts[env_ids] = 0
         self.proprio_hist_buf[env_ids] = 0
         self.at_reset_buf[env_ids] = 1
+        self.episode_success[env_ids] = False
+
+    def _target_angle_max(self):
+        return math.radians(self.cfg.target_angle_levels[self.curriculum_level])
+
+    def _sample_axis_limited_targets(self, env_ids, start_pos, start_rot):
+        axis = self.target_rot_axis[env_ids]
+        axis = axis / torch.clamp(torch.norm(axis, dim=-1, keepdim=True), min=1.0e-6)
+        max_angle = self._target_angle_max()
+        self.target_delta_angle[env_ids] = (2.0 * torch.rand(len(env_ids), device=self.device) - 1.0) * max_angle
+        delta_rot = quat_from_axis_angle(axis, self.target_delta_angle[env_ids])
+        target_rot = quat_mul(delta_rot, start_rot)
+        self.target_object_pos[env_ids] = start_pos
+        self.target_object_rot[env_ids] = normalize_quat(target_rot)
+
+    def _update_target_curriculum(self, env_ids):
+        if self.common_step_counter <= 0 or len(env_ids) == 0:
+            return
+        reset_success = self.episode_success[env_ids].float().mean()
+        alpha = self.cfg.target_curriculum_ema_alpha
+        self.curriculum_success_ema = (1.0 - alpha) * self.curriculum_success_ema + alpha * reset_success
+        max_level = len(self.cfg.target_angle_levels) - 1
+        can_update = self.common_step_counter - self.last_curriculum_update_step >= self.cfg.target_curriculum_update_interval
+        if can_update and self.curriculum_level < max_level and self.curriculum_success_ema >= self.cfg.target_curriculum_success_threshold:
+            self.curriculum_level += 1
+            self.curriculum_success_ema.zero_()
+            self.last_curriculum_update_step = self.common_step_counter
+            print(f"update target curriculum: level={self.curriculum_level}, max_angle={math.degrees(self._target_angle_max()):.1f} deg")
 
     def _refresh_lab(self):
         # data for hand
@@ -445,7 +503,11 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
         obs_buf = (self.obs_buf_lag_history[:, -3:].reshape(self.num_envs, -1)).clone()
 
         self.proprio_hist_buf[:] = self.obs_buf_lag_history[:, -self.cfg.prop_hist_len:].clone()
-        self.priv_info_buf[:, 0:3] = self.object_pos - self.object_default_pose[:, :3]
+        target_rel_rot = normalize_quat(quat_mul(self.target_object_rot, quat_conjugate(self.object_rot)))
+        self.priv_info_buf[:, 0:3] = self.object_pos - self.target_object_pos
+        self.priv_info_buf[:, 3:7] = target_rel_rot
+        self.priv_info_buf[:, 7] = quat_error_magnitude(target_rel_rot)
+        self.priv_info_buf[:, 8] = self.target_delta_angle / torch.pi
 
         return obs_buf
     
@@ -467,6 +529,28 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
         asset.root_physx_view.set_masses(value, env_ids)
 
 
+
+@torch.jit.script
+def normalize_quat(q: torch.Tensor) -> torch.Tensor:
+    q = q / torch.clamp(torch.norm(q, dim=-1, keepdim=True), min=1.0e-6)
+    q = torch.where(q[:, 0:1] < 0.0, -q, q)
+    return q
+
+@torch.jit.script
+def quat_error_magnitude(q: torch.Tensor) -> torch.Tensor:
+    q = q / torch.clamp(torch.norm(q, dim=-1, keepdim=True), min=1.0e-6)
+    w = torch.clamp(torch.abs(q[:, 0]), max=1.0)
+    return 2.0 * torch.acos(w)
+
+@torch.jit.script
+def quat_from_axis_angle(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
+    axis = axis / torch.clamp(torch.norm(axis, dim=-1, keepdim=True), min=1.0e-6)
+    half_angle = 0.5 * angle
+    quat = torch.zeros((axis.shape[0], 4), device=axis.device, dtype=axis.dtype)
+    quat[:, 0] = torch.cos(half_angle)
+    quat[:, 1:4] = axis * torch.sin(half_angle).unsqueeze(-1)
+    return normalize_quat(quat)
+
 @torch.jit.script
 def scale(x, lower, upper):
     return 0.5 * (x + 1.0) * (upper - lower) + lower
@@ -477,14 +561,16 @@ def unscale(x, lower, upper):
 
 @torch.jit.script
 def compute_rewards(
-    rotate_reward: torch.Tensor, rotate_reward_scale: float,
+    orientation_reward: torch.Tensor, orientation_error_reward_scale: float,
+    success: torch.Tensor, orientation_success_bonus: float,
     object_linvel_penalty: torch.Tensor, object_linvel_penalty_scale: float,
     pos_diff_penalty: torch.Tensor, pos_diff_penalty_scale: float,
     torque_penalty: torch.Tensor, torque_penalty_scale: float,
     work_penalty: torch.Tensor, work_penalty_scale: float,
     object_pos_diff: torch.Tensor, object_pos_reward_scale: float,
 ):
-    reward = rotate_reward * rotate_reward_scale
+    reward = orientation_reward * orientation_error_reward_scale
+    reward += success * orientation_success_bonus
     reward += object_linvel_penalty * object_linvel_penalty_scale
     reward += pos_diff_penalty * pos_diff_penalty_scale
     reward += torque_penalty * torque_penalty_scale
