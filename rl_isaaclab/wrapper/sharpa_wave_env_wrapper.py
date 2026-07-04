@@ -172,6 +172,12 @@ class GymStyleEnvWrapper(VecEnv):
         # return the step information
         return obs_dict, rew, dones, extras
     
+    def render(self):
+        """Forward render calls to the wrapped environment."""
+        if hasattr(self.env, "render"):
+            return self.env.render()
+        return self.unwrapped.render()
+    
     def zero_actions(self) -> torch.Tensor:
         return torch.zeros(self.action_space.shape, device=self.device, dtype=torch.float)
 

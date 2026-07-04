@@ -8,6 +8,11 @@ import argparse
 import sys
 import shutil
 
+# make prints show up immediately even when stdout is redirected to a log file,
+# so a crash doesn't hide all the progress output that was buffered before it
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 from isaaclab.app import AppLauncher
 
 # add argparse arguments
@@ -20,6 +25,13 @@ parser.add_argument("--load_path", type=str, default=None, help="Checkpoint path
 parser.add_argument("--max_agent_steps", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--algorithm", type=str, default=None, help="Run training with multiple GPUs or nodes.")
 parser.add_argument("--resume", action="store_true", default=False, help="Resume training from checkpoint.")
+parser.add_argument("--wandb_project", type=str, default="sharpa-wave", help="WandB project name.")
+parser.add_argument("--wandb_entity", type=str, default=None, help="WandB entity.")
+parser.add_argument("--wandb_mode", type=str, default=None, help="WandB mode (online, offline, disabled).")
+parser.add_argument("--wandb_run_name", type=str, default=None, help="WandB run name.")
+parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
+parser.add_argument("--video_length", type=int, default=200, help="Length of recorded video in steps.")
+parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings in steps.")
 parser.add_argument("--finetune_dataset_dir", type=str, default=None, help="Dir to finetune dataset.")
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -29,6 +41,13 @@ args_cli, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
 
 # launch omniverse app
+if args_cli.video:
+    args_cli.enable_cameras = True
+    # Kit auto-enables multi-GPU rendering by default whenever a node has multiple identical GPUs,
+    # regardless of --device. On a shared multi-GPU node that makes the renderer fan out onto every
+    # GPU (including ones another job's PhysX/CUDA context owns), which corrupts memory. Force it off
+    # so rendering stays pinned to the single --device GPU, matching physics.
+    args_cli.multi_gpu = False
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
@@ -70,6 +89,14 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     agent_cfg["load_path"] = args_cli.load_path if args_cli.load_path is not None else agent_cfg["load_path"]
     env_cfg.grasp_cache_path = args_cli.cache if args_cli.cache is not None else env_cfg.grasp_cache_path
     agent_cfg["algorithm"]['minibatch_size'] = min([args_cli.num_envs * 8, 32768])
+    agent_cfg["wandb"] = True
+    agent_cfg["wandb_project"] = args_cli.wandb_project
+    agent_cfg["wandb_entity"] = args_cli.wandb_entity
+    agent_cfg["wandb_mode"] = args_cli.wandb_mode
+    agent_cfg["wandb_run_name"] = args_cli.wandb_run_name
+    agent_cfg["task_name"] = args_cli.task
+    if args_cli.video:
+        env_cfg.viewer.env_index = 0
     if agent_cfg["algo"] == "ProprioAdapt":
         env_cfg.gravity_curriculum = False
     config = ConfigWrapper(agent_cfg, env_cfg)
@@ -86,7 +113,19 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     print(f"Exact experiment name requested from command line: {log_dir}")
 
     # create isaac environment
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
+    render_mode = "rgb_array" if args_cli.video else None
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode=render_mode)
+    if args_cli.video:
+        video_dir = os.path.join(log_dir, "videos", "train")
+        video_kwargs = {
+            "video_folder": video_dir,
+            "step_trigger": lambda step: step % args_cli.video_interval == 0,
+            "video_length": args_cli.video_length,
+            "disable_logger": True,
+        }
+        print(f"[INFO] Recording video to: {video_dir}")
+        print(f"[INFO] Video kwargs: {video_kwargs}")
+        env = gym.wrappers.RecordVideo(env, **video_kwargs)
     env = GymStyleEnvWrapper(env, clip_actions=env_cfg.clip_actions)
     agent = eval(agent_cfg["algo"])(env, output_dir=log_dir, full_config=config)
 
@@ -104,11 +143,14 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
         # load previously trained model
         agent.restore_train(resume_path)
 
-    # run training
-    agent.train()
-    
-    # close the simulator
-    env.close()
+    try:
+        # run training
+        agent.train()
+    finally:
+        if hasattr(agent, "finish_logger"):
+            agent.finish_logger()
+        # close the simulator
+        env.close()
 
 if __name__ == "__main__":
     # run the main function

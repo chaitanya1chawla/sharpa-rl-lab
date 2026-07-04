@@ -19,6 +19,7 @@ from rl_isaaclab.algo.models.models import ActorCritic
 from rl_isaaclab.algo.models.running_mean_std import RunningMeanStd
 
 from rl_isaaclab.utils.misc import AverageScalarMeter
+from rl_isaaclab.utils.wandb_logger import finish_wandb_run, init_wandb_run, log_wandb_metrics
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -92,11 +93,26 @@ class PPO(object):
         # ---- Snapshot
         self.save_freq = self.ppo_config['save_frequency']
         self.save_best_after = self.ppo_config['save_best_after']
-        # ---- Tensorboard Logger ----
+        # ---- Tensorboard / WandB Logger ----
         self.extra_info = {}
         if create_output_dir:
             writer = SummaryWriter(self.tb_dif)
             self.writer = writer
+        self.wandb_run = init_wandb_run(
+            project=self.ppo_config.get('wandb_project', 'sharpa-wave'),
+            entity=self.ppo_config.get('wandb_entity', None),
+            name=self.ppo_config.get('wandb_run_name') or os.path.basename(self.output_dir),
+            mode=self.ppo_config.get('wandb_mode', None),
+            dir=self.output_dir,
+            config={
+                'algo': 'PPO',
+                'experiment_name': self.ppo_config.get('experiment_name'),
+                'task_name': self.ppo_config.get('task_name'),
+                'seed': self.ppo_config.get('seed'),
+                'num_actors': self.num_actors,
+                'priv_info_dim': self.priv_info_dim,
+            },
+        )
 
         self.episode_rewards = AverageScalarMeter(100)
         self.episode_lengths = AverageScalarMeter(100)
@@ -120,21 +136,29 @@ class PPO(object):
         self.rl_train_time = 0
         self.all_time = 0
 
+    def _log_scalar(self, key, value):
+        self.writer.add_scalar(key, value, self.agent_steps)
+        log_wandb_metrics(self.wandb_run, {key: value}, self.agent_steps)
+
+    def _log_dict(self, metrics):
+        for key, value in metrics.items():
+            self._log_scalar(key, value)
+
     def write_stats(self, a_losses, c_losses, b_losses, entropies, kls):
-        self.writer.add_scalar('performance/RLTrainFPS', self.agent_steps / self.rl_train_time, self.agent_steps)
-        self.writer.add_scalar('performance/EnvStepFPS', self.agent_steps / self.data_collect_time, self.agent_steps)
-
-        self.writer.add_scalar('losses/actor_loss', torch.mean(torch.stack(a_losses)).item(), self.agent_steps)
-        self.writer.add_scalar('losses/bounds_loss', torch.mean(torch.stack(b_losses)).item(), self.agent_steps)
-        self.writer.add_scalar('losses/critic_loss', torch.mean(torch.stack(c_losses)).item(), self.agent_steps)
-        self.writer.add_scalar('losses/entropy', torch.mean(torch.stack(entropies)).item(), self.agent_steps)
-
-        self.writer.add_scalar('info/last_lr', self.last_lr, self.agent_steps)
-        self.writer.add_scalar('info/e_clip', self.e_clip, self.agent_steps)
-        self.writer.add_scalar('info/kl', torch.mean(torch.stack(kls)).item(), self.agent_steps)
+        self._log_dict({
+            'performance/RLTrainFPS': self.agent_steps / self.rl_train_time,
+            'performance/EnvStepFPS': self.agent_steps / self.data_collect_time,
+            'losses/actor_loss': torch.mean(torch.stack(a_losses)).item(),
+            'losses/bounds_loss': torch.mean(torch.stack(b_losses)).item(),
+            'losses/critic_loss': torch.mean(torch.stack(c_losses)).item(),
+            'losses/entropy': torch.mean(torch.stack(entropies)).item(),
+            'info/last_lr': self.last_lr,
+            'info/e_clip': self.e_clip,
+            'info/kl': torch.mean(torch.stack(kls)).item(),
+        })
 
         for k, v in self.extra_info.items():
-            self.writer.add_scalar(f'{k}', v, self.agent_steps)
+            self._log_scalar(f'{k}', v)
 
     def set_eval(self):
         self.model.eval()
@@ -179,8 +203,8 @@ class PPO(object):
 
             mean_rewards = self.episode_rewards.get_mean()
             mean_lengths = self.episode_lengths.get_mean()
-            self.writer.add_scalar('episode_rewards/step', mean_rewards, self.agent_steps)
-            self.writer.add_scalar('episode_lengths/step', mean_lengths, self.agent_steps)
+            self._log_scalar('episode_rewards/step', mean_rewards)
+            self._log_scalar('episode_lengths/step', mean_lengths)
             checkpoint_name = f'ep_{self.epoch_num}_step_{int(self.agent_steps // 1e6):04}M_reward_{mean_rewards:.2f}'
 
             if self.save_freq > 0:
@@ -202,6 +226,7 @@ class PPO(object):
             print(info_string)
 
         print('max steps achieved')
+        self.finish_logger()
 
     def save(self, name):
         weights = {
@@ -220,15 +245,22 @@ class PPO(object):
         self.model.load_state_dict(checkpoint['model'])
         self.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
 
+    def finish_logger(self):
+        finish_wandb_run(self.wandb_run)
+
     def restore_test(self, fn):
         checkpoint = torch.load(fn)
         self.model.load_state_dict(checkpoint['model'])
         if self.normalize_input:
             self.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
 
-    def test(self):
+    def test(self, max_steps: int | None = None, frame_callback=None, env=None):
         self.set_eval()
-        obs_dict = self.env.reset()
+        env = self.env if env is None else env
+        obs_dict = env.reset()
+        if frame_callback is not None:
+            frame_callback(env.render())
+        step = 0
         while True:
             input_dict = {
                 'obs': self.running_mean_std(obs_dict['obs']),
@@ -236,7 +268,13 @@ class PPO(object):
             }
             mu = self.model.act_inference(input_dict)
             mu = torch.clamp(mu, -1.0, 1.0)
-            obs_dict, r, done, info = self.env.step(mu)
+            obs_dict, r, done, info = env.step(mu)
+            if frame_callback is not None:
+                frame_callback(env.render())
+            if max_steps is not None:
+                step += 1
+                if step >= max_steps:
+                    break
 
     def train_epoch(self):
         # collect minibatch data
